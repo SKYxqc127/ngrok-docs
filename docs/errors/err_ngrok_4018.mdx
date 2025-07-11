@@ -1,21 +1,120 @@
----
-hide_table_of_contents: true
-displayed_sidebar: docs
----
+use axum::{
+    Json, Router,
+    extract::State,
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use image::{GenericImageView, imageops::FilterType};
+use local_ip_address::local_ip;
+use nsfw::{Model, create_model, examine};
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fs::File,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
+use tokio::{net::TcpListener, time::Instant};
+use tower_http::{
+    compression::{CompressionLayer, predicate::SizeAbove},
+    decompression::DecompressionLayer,
+};
 
-import ErrorDetails from "/src/components/ErrorDetails";
+#[derive(Clone, Deserialize, Serialize)]
+struct Input {
+    image_url: String,
+}
 
-# ERR_NGROK_4018
+async fn index(State(model): State<Arc<Model>>, Json(params): Json<Input>) -> Response {
+    let elapsed_download = Instant::now();
+    let client = reqwest::Client::new();
+    let image_response = client
+        .get(&params.image_url)
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
+        .send()
+        .await
+        .unwrap();
+    let image_bytes = image_response.bytes().await.unwrap();
+    println!(
+        "download -> {:0.3}s",
+        elapsed_download.elapsed().as_secs_f32()
+    );
 
-### Message
+    let elapsed_load = Instant::now();
+    let image_raw = image::load_from_memory(&image_bytes).unwrap();
+    println!("load -> {:0.3}s", elapsed_load.elapsed().as_secs_f32());
+    let image_processed = image_raw.resize(1024, 1024, FilterType::Lanczos3);
 
-Usage of ngrok requires a verified account and authtoken.
+    let elapsed_examine = Instant::now();
+    let result = examine(&model, &image_processed.to_rgba8()).unwrap();
+    println!(
+        "moderation -> {:0.3}s",
+        elapsed_examine.elapsed().as_secs_f32()
+    );
 
-Sign up for an account: https://dashboard.ngrok.com/signup
-Install your authtoken: https://dashboard.ngrok.com/get-started/your-authtoken
+    let mut hashmap: HashMap<String, f32> = HashMap::new();
+    for v in result {
+        hashmap.insert(v.metric.to_string(), v.score);
+    }
+    println!("category {:#?}", hashmap);
 
-<ErrorDetails error="err_ngrok_4018" />
+    let mut category = "Neutral";
 
-### Further help
+    if hashmap.get("Porn").unwrap() > &0.3 {
+        category = "Porn";
+    } else if hashmap.get("Hentai").unwrap() > &0.2 {
+        category = "Hentai";
+    } else if hashmap.get("Sexy").unwrap() > &0.2 {
+        category = "Sexy";
+    } else if hashmap.get("Neutral").unwrap() < &0.2 {
+        if hashmap.get("Drawings").unwrap() > &0.6 {
+            category = "Neutral";
+        } else {
+            category = "UnNeutral";
+        }
+    }
 
-If you're having trouble resolving this error, please reach out to [support@ngrok.com](mailto:support@ngrok.com?subject=Help%20with%20ERR_NGROK_4018)
+    let elapsed_serialize = Instant::now();
+    let mut result: Vec<u8> = Vec::new();
+    result.extend_from_slice(&(category.len() as u16).to_le_bytes());
+    result.extend_from_slice(&(category.as_bytes()));
+    result.extend_from_slice(&(image_processed.width() as u16).to_le_bytes());
+    result.extend_from_slice(&(image_processed.height() as u16).to_le_bytes());
+    if category == "Neutral" {
+        for (_x, _y, rgba) in image_processed.pixels() {
+            result.extend_from_slice(&[rgba[0], rgba[1], rgba[2], rgba[3]]);
+        }
+    }
+    println!(
+        "serialize -> {:0.3}s",
+        elapsed_serialize.elapsed().as_secs_f32()
+    );
+
+    (StatusCode::OK, result).into_response()
+}
+
+#[tokio::main]
+async fn main() {
+    let model = Arc::new(create_model(File::open("model.onnx").unwrap()).unwrap());
+
+    let app = Router::new()
+        .route("/", post(index))
+        .with_state(model)
+        .layer(DecompressionLayer::new())
+        .layer(CompressionLayer::new().compress_when(SizeAbove::new(1024)));
+
+    let ip = local_ip().unwrap_or_else(|_| {
+        println!("Could not determine local IP address, using localhost");
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+    });
+
+    const PORT: u16 = 3000;
+    let socket_addr = SocketAddr::new(ip, PORT);
+
+    println!("Server running at http://{}:{}", ip, PORT);
+
+    axum::serve(TcpListener::bind(socket_addr).await.unwrap(), app)
+        .await
+        .unwrap();
+}
